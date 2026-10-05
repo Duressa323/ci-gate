@@ -33,6 +33,7 @@ import json
 import os
 import plistlib
 import sys
+from urllib.parse import unquote
 from xml.etree import ElementTree
 
 SEVERITIES = ("error", "warning", "note")
@@ -42,10 +43,23 @@ SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITIES)}
 # still shows up in the PR comment, it just does not block a merge on its own.
 BLOCKING_SEVERITIES = ("error", "warning")
 
-# Every tool whose report the gate expects to find.  Kept in step with the
-# `--tool` arguments in ci.yml's annotate steps; test_ci_gate.py asserts the
-# two lists agree, so adding a scanner without listing it here fails the
-# pipeline rather than quietly going unchecked.
+# Exit codes.  A contract with CI, mirroring triage.py: 0 means clean, 1 means
+# "there are findings to action" (expected, and already reported), 2 means the
+# gate itself could not do its job (must fail loudly).  Keeping 2 distinct from
+# 1 is what stops a broken gate reading as a clean run -- the entire bug this
+# file's report parser was rewritten to close, so it would be self-defeating to
+# report an unreadable report the same way as an empty one.
+EXIT_CLEAN = 0
+EXIT_ACTIONABLE = 1
+EXIT_ERROR = 2
+
+# The DEFAULT tool set: the C/C++ analyzers this toolchain was written for.
+# It is only a default.  A repository running a different toolchain declares
+# `expected_tools` in `.ci/gate.config.json` and that list wins, because a
+# shared default cannot be right about every repository at once -- demanding a
+# clang report from a Python repository fails every run forever, while failing
+# to demand a report the repository does run is the fail-open this gate exists
+# to prevent.  tests/test_python_tooling.py asserts the two cannot drift.
 EXPECTED_TOOLS = (
     "clang-analyze",
     "cppcheck",
@@ -53,6 +67,16 @@ EXPECTED_TOOLS = (
     "trivy",
     "osv-scanner",
 )
+
+# Rendered when a repository has NOT declared its own `expected_tools`, i.e.
+# when it is on the C/C++ default above.  Kept as literal text rather than
+# derived so that adding this file to a C repository does not silently reword
+# the PR comment its maintainers already read; a repository that declares its
+# own tools gets a line derived from them instead.
+DEFAULT_TOOLS_LINE = ("`clang --analyze`, `cppcheck`, `gitleaks`, `trivy fs`, "
+                      "`osv-scanner`.")
+DEFAULT_CLEAN_LINE = ("No findings. All four analyzers and both CVE scanners "
+                      "are clean.")
 
 # ─────────────────────────── repo identity config ──────────────────────────
 #
@@ -102,6 +126,13 @@ DEFAULT_CONFIG = {
     "rationale_rule1": None,
     "rationale_before_you_start": None,
     "rationale_comment_footer": None,
+    # The tools whose reports this repository's CI produces, overriding the
+    # C/C++ EXPECTED_TOOLS default.  A list, unlike every other key here, so it
+    # is NOT in REQUIRED_CONFIG_KEYS: absent means "use the default", which is
+    # correct for the C repositories this tool was written for.  Validated in
+    # load_config() -- an empty list would silently disable the missing-tool
+    # check, which is the fail-open, so it is rejected rather than honoured.
+    "expected_tools": None,
 }
 
 # Keys that must be present and non-empty in every config file.  A config
@@ -186,6 +217,24 @@ def load_config(path=None):
             "Every key must be a non-empty string; silence here would "
             "render another repository's name into this one's PR comment."
             % (resolved, ", ".join(sorted(missing))))
+
+    tools = out.get("expected_tools")
+    if tools is not None:
+        # An empty or malformed list would not read as a typo -- it would read
+        # as "this repository expects no analyzers", which disables the
+        # missing-tool check and turns the gate into a rubber stamp.  So the
+        # only two accepted shapes are absent (use the default) and a non-empty
+        # list of non-empty strings.
+        if (not isinstance(tools, list) or not tools
+                or not all(isinstance(t, str) and t.strip() for t in tools)):
+            raise ConfigError(
+                "gate config %s: `expected_tools` must be a non-empty list of "
+                "non-empty strings, got %r\n"
+                "An empty or non-list value would make the gate expect no "
+                "analyzers at all, so a scanner that never ran would read as "
+                "clean. Omit the key entirely to use the built-in default."
+                % (resolved, tools))
+        out["expected_tools"] = [t.strip() for t in tools]
     return out
 
 
@@ -196,6 +245,17 @@ CONFIG = load_config()
 
 
 # ────────────────────────────── normalisation ──────────────────────────────
+
+
+# bandit's own severity vocabulary -> the gate's.  Anything bandit does not
+# name falls to "note" rather than being invented upward: an unrecognised
+# level must not silently become a blocking error, and must not silently
+# become a pass either -- the finding is visible in the report either way.
+BANDIT_SEVERITY = {
+    "high": "error",
+    "medium": "warning",
+    "low": "note",
+}
 
 
 def content_hash(tool, rule_id, path, message):
@@ -259,7 +319,50 @@ def _sarif_level(result):
     return "error"
 
 
-def parse_sarif(text, tool):
+def normalise_uri(uri, root="."):
+    """
+    Turn a SARIF artifact URI into a repo-relative path.
+
+    ruff (and any tool emitting absolute URIs) reports
+    `file:///home/runner/work/mouse/mouse/main.py`, which is wrong twice over:
+    it leaks the runner's home directory into a PR comment, and because `path`
+    feeds the content hash, the identical finding hashes differently on every
+    machine -- so a baseline entry written locally would never match in CI and
+    the finding could never be suppressed.
+
+    Percent-escapes are decoded (`%20` is a space in a path) and the result is
+    made relative to the repository root.  A URI outside the root is left
+    absolute rather than mangled into a `../..` chain: it genuinely is not a
+    repo file, and pretending otherwise would hide that.
+    """
+    if not uri:
+        return ""
+    text = uri
+    absolute_from_uri = False
+    if text.startswith("file://"):
+        text = unquote(text[len("file://"):])
+        # file://host/path is authority + path; the host is not ours to keep.
+        slash = text.find("/")
+        text = text[slash:] if slash >= 0 else "/" + text
+        absolute_from_uri = True
+    elif "%" in text:
+        text = unquote(text)
+    if root:
+        base = os.path.abspath(root)
+        # A `file://` URI is already absolute.  Joining it onto the root as if
+        # it were relative produced "root/home/runner/..." -- a path that is in
+        # no file, and one that differs per checkout.
+        absolute = (os.path.abspath(text) if absolute_from_uri
+                    or os.path.isabs(text)
+                    else os.path.abspath(os.path.join(base, text)))
+        if absolute == base:
+            return ""
+        if absolute.startswith(base + os.sep):
+            return os.path.relpath(absolute, base)
+    return text
+
+
+def parse_sarif(text, tool, root="."):
     doc = json.loads(text)
     out = []
     for run in doc.get("runs", []):
@@ -268,7 +371,8 @@ def parse_sarif(text, tool):
             locs = result.get("locations") or []
             if locs:
                 phys = (locs[0] or {}).get("physicalLocation") or {}
-                path = phys.get("artifactLocation", {}).get("uri", "")
+                path = normalise_uri(
+                    (phys.get("artifactLocation") or {}).get("uri", ""), root)
                 line = phys.get("region", {}).get("startLine", 0)
             msg = (result.get("message") or {}).get("text", "")
             out.append(Finding.make(tool, _sarif_level(result), path, line,
@@ -323,6 +427,47 @@ def parse_clang_plist(text, tool="clang-analyze", root="."):
     return out
 
 
+def parse_bandit_json(text, tool="bandit"):
+    """
+    bandit's native JSON report.
+
+    bandit has NO SARIF output -- `bandit --help` offers only
+    csv/custom/html/json/screen/txt/xml/yaml -- so its native shape (top-level
+    `results`, each entry carrying `issue_severity` / `issue_confidence` /
+    `test_id` / `filename` / `line_number`) is the only thing CI can hand us.
+
+    Severity maps by bandit's own `issue_severity` rather than being flattened
+    to a constant: HIGH and MEDIUM both block, LOW is advisory.  Confidence is
+    carried into the message rather than dropped, because the same MEDIUM
+    finding at LOW confidence is a genuinely different thing to review.
+
+    `errors` is deliberately NOT read as findings: bandit writes a list of
+    per-file exceptions there when a plugin crashes, which is a scanner fault
+    rather than a finding about the code.  The workflow asserts on it
+    separately, because "the scanner broke" must never read as "the code is
+    clean".
+    """
+    doc = json.loads(text)
+    out = []
+    for result in doc.get("results", []):
+        if not isinstance(result, dict):
+            continue
+        sev = (result.get("issue_severity") or "").lower()
+        # Lower-cased for the severity lookup, but the message keeps bandit's
+        # own casing: it is quoted back to a reviewer in the PR comment, and
+        # rewriting HIGH as "high" makes the tool's output harder to match
+        # against the report it wrote.
+        confidence = result.get("issue_confidence") or ""
+        message = result.get("issue_text") or ""
+        if confidence:
+            message = "%s [confidence: %s]" % (message, confidence)
+        out.append(Finding.make(tool, BANDIT_SEVERITY.get(sev, "note"),
+                                normalise_uri(result.get("filename", "")),
+                                result.get("line_number"), message,
+                                result.get("test_id", "")))
+    return out
+
+
 def parse_gate_json(text, tool=None):
     """
     Parse ci/gate.py's own normalised output.
@@ -345,7 +490,55 @@ def parse_gate_json(text, tool=None):
     return out
 
 
-def parse_report(path, tool=None):
+def parse_json_report(doc, tool=None, name="", root="."):
+    """
+    Dispatch on a parsed JSON document's top-level shape.
+
+    Fails CLOSED on anything unrecognised.  The previous version dispatched
+    "if it has `findings`, it's gate JSON, otherwise it must be SARIF" -- so
+    any tool whose JSON is neither shape fell through to the SARIF reader,
+    found no `runs` key, and returned an empty list.  The caller then reported
+    that tool as having zero findings, which is the exact fail-open this gate
+    exists to prevent: bandit emits {errors, generated_at, metrics, results},
+    has no SARIF output at all, and every one of its findings was silently
+    discarded while the gate called it clean.
+
+    The cost of the strict version is one unknown-schema report per future
+    analyzer until a parser is written.  That is the correct direction to
+    fail: an unrecognised report must not read as a clean one.
+    """
+    # Every ValueError raised here is caught by collect_strict() and turned
+    # into one `::error` line plus exit 2.  That is why these are ValueError
+    # and not TypeError: a TypeError would escape the handler, and the gate
+    # would die on a traceback instead of naming the unreadable report.
+    if isinstance(doc, list):
+        # e.g. `gitleaks detect -f json`, which is a bare array.  Not a
+        # failure to parse -- just not a shape this gate reads.  Say so
+        # rather than letting it reach the SARIF reader and raise
+        # AttributeError on `.get`.
+        detail = ("top-level JSON array (gitleaks `-f json` emits one; use "
+                  "`-f sarif` so the gate can read it)")
+    elif isinstance(doc, dict):
+        if "findings" in doc:
+            return parse_gate_json(json.dumps(doc), tool)
+        if "runs" in doc:
+            return parse_sarif(json.dumps(doc),
+                               tool or os.path.splitext(name)[0], root)
+        if "results" in doc:
+            return parse_bandit_json(json.dumps(doc), tool or "bandit")
+        detail = "top-level keys %s" % (", ".join(sorted(map(str, doc)))
+                                        or "(none)")
+    else:
+        detail = "top-level %s" % type(doc).__name__
+
+    raise ValueError(
+        "unrecognised report shape in %s: %s. Expected `findings` (gate "
+        "JSON), `runs` (SARIF) or `results` (bandit). Refusing to report "
+        "this report as zero findings -- add a parser to ci/gate/gate.py "
+        "instead." % (name or "report", detail))
+
+
+def parse_report(path, tool=None, root="."):
     """Dispatch on file content so a job never has to name the format."""
     name = os.path.basename(path)
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -353,15 +546,12 @@ def parse_report(path, tool=None):
     stripped = text.lstrip()
 
     if name.endswith(".plist"):
-        return parse_clang_plist(text, tool or "clang-analyze")
+        return parse_clang_plist(text, tool or "clang-analyze", root)
     if stripped.startswith("<?xml") or stripped.startswith("<results"):
         # cppcheck XMLv2 is the only XML these jobs emit; SARIF is JSON.
         return parse_cppcheck_xml(text, tool or "cppcheck")
     if stripped.startswith("{") or stripped.startswith("["):
-        doc = json.loads(text)
-        if isinstance(doc, dict) and "findings" in doc:
-            return parse_gate_json(text, tool)
-        return parse_sarif(text, tool or os.path.splitext(name)[0])
+        return parse_json_report(json.loads(text), tool, name, root)
     raise ValueError("unrecognised report format: %s" % path)
 
 
@@ -464,7 +654,7 @@ def summary_markdown(findings, preexisting, new, baseline, gate_failed,
     lines = [
         "## %s static analysis — %s" % (CONFIG["display_name"], verdict),
         "",
-        "`clang --analyze`, `cppcheck`, `gitleaks`, `trivy fs`, `osv-scanner`.",
+        tools_line(),
         "",
         "| severity | findings |",
         "|---|---|",
@@ -495,7 +685,7 @@ def summary_markdown(findings, preexisting, new, baseline, gate_failed,
                             escape_annotation(f["message"])[:200]))
         lines.append("")
     elif not findings:
-        lines += ["No findings. All four analyzers and both CVE scanners are clean.", ""]
+        lines += [clean_line(expected_tools(None)), ""]
     if missing:
         lines += [
             "### Analyzers that did not report",
@@ -516,7 +706,7 @@ def summary_markdown(findings, preexisting, new, baseline, gate_failed,
 # ──────────────────────────────── commands ─────────────────────────────────
 
 
-def collect(report_paths):
+def collect(report_paths, root="."):
     # Expand before parsing.  `gate.py annotate analysis/clang` is given a
     # DIRECTORY (the clang job writes one plist per source into it); calling
     # parse_report() on the directory itself raised IsADirectoryError, killed
@@ -525,12 +715,36 @@ def collect(report_paths):
     # whole analyzer was silently disabled by a crash.
     findings = []
     for path in expand_reports(report_paths):
-        findings.extend(parse_report(path))
+        findings.extend(parse_report(path, None, root))
     return dedup(findings)
 
 
+def collect_strict(report_paths, root="."):
+    """
+    collect(), but an unreadable report is a loud failure rather than a crash.
+
+    ValueError from parse_report propagates here and is turned into a
+    `::error` annotation plus exit 2 by the caller.  Letting it escape as a
+    traceback would still fail the job, but it would bury the one line that
+    says which report was unreadable and why -- and the reason that matters is
+    that a silently-dropped report and a report with zero findings look
+    identical from the outside.  Say which file broke.
+    """
+    try:
+        return collect(report_paths, root)
+    except ValueError as exc:
+        print("::error title=unreadable analyzer report::%s"
+              % escape_annotation(str(exc)), file=sys.stderr)
+        print("\nAnalysis gate ABORTED: %s" % exc, file=sys.stderr)
+        return None
+
+
 def cmd_annotate(args):
-    findings = collect(args.reports)
+    findings = collect_strict(args.reports, args.root)
+    if findings is None:
+        # Never fall through to the "0 finding(s) from <tool>" notice below:
+        # printing zero here is precisely the fail-open this closes.
+        return EXIT_ERROR
     for f in sorted(findings, key=sort_key):
         print(annotation(f))
     if args.out:
@@ -541,7 +755,7 @@ def cmd_annotate(args):
     print("::notice title=%s::%d finding(s) from %s"
           % (escape_annotation(args.tool), len(findings),
              escape_annotation(args.tool)))
-    return 0
+    return EXIT_CLEAN
 
 
 def expand_reports(paths, exclude=None):
@@ -609,16 +823,15 @@ def expected_tools(names):
     """
     The tools this invocation should expect reports from.
 
-    Defaults to every tool CI runs.  A partial local run (`make analyze` covers
-    clang + cppcheck only, `make scan` the other three) must declare its own
-    subset, or the fail-closed missing-tool check reports the three tools it
-    never invoked as crashed and the local mirror can never print a passing
-    verdict — which is exactly what it did: `make analyze` exited 1 on a clean
-    tree, on every run, because it skipped the per-tool annotate step that
-    produces the `{tool, findings}` JSON this check reads.
+    Precedence: an explicit `--expect` on the command line, then the
+    repository's `expected_tools` config key, then the built-in C/C++ default.
+    A partial local run (`make analyze` covers two tools, `make scan` the rest)
+    must declare its own subset, or the fail-closed missing-tool check reports
+    the tools it never invoked as crashed and the local mirror can never print
+    a passing verdict.
     """
     if not names:
-        return EXPECTED_TOOLS
+        return tuple(CONFIG.get("expected_tools") or EXPECTED_TOOLS)
     out = []
     for chunk in names:
         for name in str(chunk).split(","):
@@ -628,15 +841,47 @@ def expected_tools(names):
     return tuple(out)
 
 
+def tools_line():
+    """
+    The sentence naming the analyzers a verdict covers.
+
+    Derived from the same list `expected_tools()` enforces, so the summary
+    cannot describe scans that were never requested.  Repositories that did
+    not override `expected_tools` keep the original literal wording.
+    """
+    declared = CONFIG.get("expected_tools")
+    if not declared:
+        return DEFAULT_TOOLS_LINE
+    return "%s." % ", ".join("`%s`" % t for t in declared)
+
+
+def clean_line(declared):
+    """
+    Wording for the no-findings case.
+
+    The original text asserted "All four analyzers and both CVE scanners are
+    clean", which is the C/C++ toolchain's shape and untrue of any repository
+    that declares its own tools -- and, worse, unreachable whenever a tool is
+    missing, because that branch is only reached once every expected tool has
+    reported.  Naming the tools that actually reported keeps the sentence
+    checkable against `findings.json`.
+    """
+    if not CONFIG.get("expected_tools"):
+        return DEFAULT_CLEAN_LINE
+    return "No findings from %s." % ", ".join("`%s`" % t for t in declared)
+
+
 def cmd_gate(args):
     report_paths = expand_reports(args.reports, exclude=args.out_dir)
     if not report_paths:
         print("::error::no analyzer reports found under %s — refusing to "
               "pass on empty input" % ", ".join(args.reports),
               file=sys.stderr)
-        return 2
+        return EXIT_ERROR
 
-    findings = collect(report_paths)
+    findings = collect_strict(report_paths, args.root)
+    if findings is None:
+        return EXIT_ERROR
     findings.sort(key=sort_key)
     baseline = load_baseline(args.baseline)
     preexisting, new = split_baseline(findings, baseline)
@@ -695,32 +940,42 @@ def cmd_gate(args):
     if missing:
         print("\nAnalysis gate FAILED: no report from %s."
               % ", ".join(missing), file=sys.stderr)
-        return 1
+        return EXIT_ACTIONABLE
     if gate_failed:
         print("\nAnalysis gate FAILED: %d new blocking finding(s)."
               % len(blocking), file=sys.stderr)
-        return 1
-    return 0
+        return EXIT_ACTIONABLE
+    return EXIT_CLEAN
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    # Both subcommands take --root: SARIF reports can carry absolute file://
+    # URIs (ruff emits them), and the finding's path feeds the content hash, so
+    # an un-normalised absolute path would make every finding unsuppressable
+    # across machines and print the runner's home directory into a PR comment.
+    root_help = ("repository root that absolute SARIF/bandit paths are made "
+                 "relative to (default: the current directory)")
+
     a = sub.add_parser("annotate", help="annotate one tool's report")
     a.add_argument("reports", nargs="+")
     a.add_argument("--tool", required=True)
     a.add_argument("--out")
+    a.add_argument("--root", default=".", help=root_help)
     a.set_defaults(func=cmd_annotate)
 
     g = sub.add_parser("gate", help="aggregate, baseline-diff and fail")
     g.add_argument("--reports", nargs="+", required=True)
     g.add_argument("--baseline", default=".ci/analysis-baseline.json")
     g.add_argument("--out-dir")
+    g.add_argument("--root", default=".", help=root_help)
     g.add_argument("--expect", nargs="*", default=None,
                    help="tools this run should expect reports from; "
-                        "defaults to every tool CI runs. A partial local "
-                        "run declares its own subset.")
+                        "defaults to the repository's `expected_tools` config "
+                        "key, else every tool the C/C++ port runs. A partial "
+                        "local run declares its own subset.")
     g.set_defaults(func=cmd_gate)
 
     args = ap.parse_args(argv)

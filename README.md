@@ -43,7 +43,14 @@ with `$GATE_CONFIG`. Every key in `gate.REQUIRED_CONFIG_KEYS` must be a non-empt
 string: a missing one aborts the run rather than falling back to another
 repository's name.
 
-## Two properties this must never lose
+`expected_tools` is the one optional key, and only a repository whose analyzer
+set differs from the C/C++ default needs it. Left unset, `gate` expects a report
+from `clang-analyze`, `cppcheck`, `gitleaks`, `trivy` and `osv-scanner` — a list
+that is right for no Python repository. It must be a non-empty list of non-empty
+strings; an empty one is rejected rather than honoured, because it would disable
+the missing-tool check below.
+
+## Three properties this must never lose
 
 1. **Findings are keyed by content** — `(tool, rule_id, file, message)` — never
    by line number. An unrelated edit above a finding must not resurrect an
@@ -55,12 +62,25 @@ repository's name.
    when an expected analyzer is missing, because a gate that reports "clean" for
    an analyzer that never ran is worse than no gate at all.
 
-Both are covered by tests, and both have been checked to actually fail when the
-property is broken — a test that cannot fail is not evidence.
+3. **A report the gate cannot READ is also a failure.** Property 2 covers a
+   report that is absent; this covers one that exists but whose shape the parser
+   does not recognise. `parse_json_report` dispatches on the top-level keys and
+   raises on anything else, so an unknown schema is exit 2 rather than a
+   confident zero. The bug that motivated it: bandit has no SARIF output, so its
+   native `{results: ...}` fell through to the SARIF reader, matched no `runs`
+   key, and every bandit finding was discarded while the gate reported the tool
+   as clean.
+
+Report formats read: clang plists, cppcheck XMLv2, SARIF, bandit's native JSON,
+and the gate's own normalised `{findings: ...}`.
+
+All three are covered by tests, and all have been checked to actually fail when
+the property is broken — a test that cannot fail is not evidence.
 
 ## Tests
 
-    python3 tests/test_invariants.py          # the two properties + config contract
+    python3 tests/test_invariants.py          # properties 1, 2 + config contract
+    python3 tests/test_python_tooling.py      # property 3, per-repo tool sets
     python3 tests/test_parity.py --reference-dir /path/to/pristine/copies
 
 `test_parity.py` is the migration's safety net: it renders the same fixture
