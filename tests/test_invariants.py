@@ -157,6 +157,150 @@ class MissingScannerIsAFailure(unittest.TestCase):
         self.assertIn("trivy", summary)
 
 
+class AnnotateMustNotManufactureAResult(unittest.TestCase):
+    """Property 2, at the step that produces the gate's evidence.
+
+    Every test in MissingScannerIsAFailure above hand-writes the
+    `{"tool": ..., "findings": []}` document the gate reads, which is correct
+    for testing `gate` and useless for testing `annotate` -- the step that
+    writes it.  So the property was asserted only from the consuming side,
+    and the producing side went unguarded.
+
+    That is how a live false green shipped.  `annotate --tool X --out X.json`
+    called collect_strict() on expand_reports(); for a report directory that
+    exists but is EMPTY -- what a crashed or uninstalled scanner leaves
+    behind, because every workflow does `mkdir -p` before running it --
+    expand_reports returns [] and collect([]) returns [], not None.  The
+    `findings is None` guard did not fire, so annotate took the success path
+    and wrote {"tool": "gitleaks", "findings": []}.
+
+    That file is the only evidence the gate uses to decide a tool reported
+    (tools_present reads doc["tool"] out of it), so the manufactured report
+    made the gate conclude the scanner had run and print PASS with it counted
+    among the tools that reported.  Reproduced against a consuming
+    repository's own ci.yml step sequence: gate exit 0, "2 tool(s) reported",
+    gitleaks never invoked.  All three defensive layers were defeated at
+    once -- the install step had run, `if-no-files-found: error` could not
+    fire because annotate had just written into the very directory it was
+    meant to prove empty, and the missing-tool check passed on the
+    manufactured report.  The ofio green run (37242692938), reproduced.
+
+    The asymmetry these tests pin: cmd_gate has guarded empty input since it
+    was written, and cmd_annotate did not.  One function was hardened
+    against exactly this and its sibling was not.
+    """
+
+    def _annotate(self, tool, make_report):
+        """Run `annotate` over a report dir prepared by make_report(dir)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            report_dir = os.path.join(tmp, tool)
+            os.makedirs(report_dir)
+            make_report(report_dir)
+            out = os.path.join(tmp, "%s.findings.json" % tool)
+            proc = subprocess.run(
+                [sys.executable, os.path.join(TOOL, "gate.py"), "annotate",
+                 report_dir, "--tool", tool, "--out", out],
+                capture_output=True, text=True)
+            written = None
+            if os.path.exists(out):
+                with open(out, "r", encoding="utf-8") as fh:
+                    written = json.load(fh)
+            return proc, written
+
+    @staticmethod
+    def _write_clean_sarif(report_dir):
+        """A scanner that RAN and found nothing: a real, parseable report."""
+        with open(os.path.join(report_dir, "report.sarif"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({
+                "version": "2.1.0",
+                "runs": [{"tool": {"driver": {"name": "ruff"}},
+                          "results": []}],
+            }, fh)
+
+    def test_annotate_on_empty_dir_exits_error(self):
+        proc, _ = self._annotate("gitleaks", lambda d: None)
+        self.assertEqual(
+            proc.returncode, gate.EXIT_ERROR,
+            "annotate exited %d on a report directory containing no report. It "
+            "must exit %d: the scanner did not run, and writing an empty "
+            "finding list here is what made the gate report a never-run "
+            "scanner as clean." % (proc.returncode, gate.EXIT_ERROR))
+
+    def test_annotate_on_empty_dir_writes_no_findings_document(self):
+        _, written = self._annotate("gitleaks", lambda d: None)
+        self.assertIsNone(
+            written,
+            "annotate wrote %r for a scanner that never produced a report. "
+            "That document is the sole input to the gate's missing-tool "
+            "check, so its existence is what tells the gate the tool "
+            "reported." % (written,))
+
+    def test_annotate_does_not_claim_zero_findings(self):
+        proc, _ = self._annotate("gitleaks", lambda d: None)
+        self.assertNotIn(
+            "0 finding(s) from gitleaks", proc.stdout,
+            "annotate announced a clean scan for a tool that never ran")
+
+    def test_annotate_still_accepts_a_genuinely_clean_scan(self):
+        """The guard must not break the case it is easy to break.
+
+        A clean scan and a scanner that never ran both leave zero findings.
+        The difference is that one leaves a REPORT.  Rejecting the clean-scan
+        case would make "no findings" indistinguishable from "no scan" and
+        would pressure someone into deleting the check rather than fixing the
+        scanner, so this is pinned deliberately rather than left to chance.
+        """
+        proc, written = self._annotate("ruff", self._write_clean_sarif)
+        self.assertEqual(
+            proc.returncode, gate.EXIT_CLEAN,
+            "annotate exited %d on a VALID report with zero findings. That is "
+            "a scanner that ran and found nothing, which must succeed."
+            % proc.returncode)
+        self.assertIsNotNone(written,
+                             "a genuinely clean scan must still be recorded")
+        self.assertEqual((written or {}).get("findings"), [])
+
+    def test_a_refused_annotate_leaves_the_gate_failing_closed(self):
+        """End to end: refuse at annotate, and the gate still says FAIL.
+
+        Defence in depth.  If a future change to annotate ever stops refusing,
+        this fails too, so the property does not rest on one guard.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            analysis = os.path.join(tmp, "analysis")
+            # One tool works; the other's directory exists but is empty.
+            ruff_dir = os.path.join(analysis, "ruff")
+            os.makedirs(ruff_dir)
+            self._write_clean_sarif(ruff_dir)
+            os.makedirs(os.path.join(analysis, "gitleaks"))
+            baseline = os.path.join(tmp, "baseline.json")
+            with open(baseline, "w", encoding="utf-8") as fh:
+                json.dump({"findings": []}, fh)
+            for tool in ("ruff", "gitleaks"):
+                subprocess.run(
+                    [sys.executable, os.path.join(TOOL, "gate.py"), "annotate",
+                     os.path.join(analysis, tool), "--tool", tool,
+                     "--out", os.path.join(analysis,
+                                           "%s.findings.json" % tool)],
+                    capture_output=True, text=True)
+            proc = subprocess.run(
+                [sys.executable, os.path.join(TOOL, "gate.py"), "gate",
+                 "--reports", analysis, "--baseline", baseline,
+                 "--out-dir", os.path.join(tmp, "out"),
+                 "--expect", "ruff", "gitleaks"],
+                capture_output=True, text=True)
+        self.assertNotEqual(
+            proc.returncode, gate.EXIT_CLEAN,
+            "gate exited 0 (PASS) with gitleaks never having produced a "
+            "report. This is the ofio false green reproduced locally: a green "
+            "pipeline that never ran a scanner it claimed to have run.")
+        self.assertIn("gitleaks", proc.stdout + proc.stderr,
+                      "the failure does not name the tool that produced no "
+                      "report, so the reader is told the pipeline is broken "
+                      "but not why")
+
+
 class ConfigContract(unittest.TestCase):
     def _load(self, doc):
         with tempfile.TemporaryDirectory() as tmp:

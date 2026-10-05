@@ -774,7 +774,53 @@ def collect_strict(report_paths, root="."):
 
 
 def cmd_annotate(args):
-    findings = collect_strict(args.reports, args.root)
+    # Refuse to annotate an EMPTY report set, and refuse it BEFORE collecting.
+    #
+    # collect_strict() cannot catch this on its own: for a report directory
+    # that exists but holds no file -- exactly what a crashed or uninstalled
+    # scanner leaves behind, because every workflow does `mkdir -p` before
+    # running the scanner -- expand_reports() returns [] and collect([]) returns
+    # [], not None.  The `findings is None` guard below therefore does not
+    # fire, annotate takes the success path, and it writes
+    # {"tool": "<name>", "findings": []}.
+    #
+    # That file is the ONLY evidence the gate uses to decide a tool reported:
+    # tools_present() reads `doc["tool"]` out of it.  So the manufactured report
+    # makes the gate conclude the scanner ran, and `gate` prints PASS with the
+    # never-run tool counted among those that reported.  Reproduced end to end
+    # against a consuming repository's own ci.yml step sequence: gate exit 0,
+    # "2 tool(s) reported", gitleaks never having been invoked.
+    #
+    # All three of the pipeline's defensive layers were defeated at once, and
+    # each one looked closed: the install step had run (the binary was invoked
+    # through a `|| echo` that swallowed the failure), `if-no-files-found: error`
+    # could not fire (annotate had just written a file INTO the directory it was
+    # meant to prove empty), and the gate's own missing-tool check passed (on
+    # the report this line used to manufacture).  This is the ofio false green,
+    # run 37242692938, reproduced locally.
+    #
+    # The asymmetry is the point: cmd_gate has guarded empty input with
+    # `if not report_paths` since it was written, and cmd_annotate never did.
+    # One function was hardened against exactly this and its sibling was not.
+    #
+    # Note what this does NOT break.  A scanner that ran and found nothing
+    # writes a real, parseable report with zero results; that still annotates
+    # cleanly and still exits 0.  Only the *absence of a report* is refused.
+    # Rejecting the clean-scan case too would make "no findings"
+    # indistinguishable from "no scan", and would pressure someone into
+    # deleting the check rather than fixing the scanner.
+    report_paths = expand_reports(args.reports)
+    if not report_paths:
+        print("::error title=%s produced no report::no report found under %s; "
+              "the scanner did not run, or crashed before writing one. "
+              "Refusing to write an empty finding list, because the gate reads "
+              "that file to decide whether %s reported -- manufacturing it "
+              "would report a scanner that never ran as clean."
+              % (escape_annotation(args.tool), ", ".join(args.reports),
+                 escape_annotation(args.tool)),
+              file=sys.stderr)
+        return EXIT_ERROR
+    findings = collect_strict(report_paths, args.root)
     if findings is None:
         # Never fall through to the "0 finding(s) from <tool>" notice below:
         # printing zero here is precisely the fail-open this closes.
