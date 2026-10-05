@@ -166,19 +166,42 @@ def find_config(start=None):
 
     $GATE_CONFIG wins outright, so a test or a one-off local run can point at
     an alternate config without touching the repository's own.
+
+    Two anchors, in order, because a config lookup that depends on the working
+    directory fails open.  This version walked up from os.getcwd() alone, so
+    `python3 ci/gate/gate.py gate` run from anywhere but the repository root
+    found nothing and fell through to DEFAULT_CONFIG -- rendering "this
+    repository" and board "UNCONFIGURED" into a PR comment and calling the
+    gate unconfigured rather than reporting that it could not find its own
+    identity.  A reviewer reading that comment has no way to tell the gate
+    apart from one that genuinely has no config.
+
+    The anchors are the caller's `start` (when given), then this file's own
+    location.  Anchoring on __file__ matches triage.py's find_repo_root(), so
+    the two agree on which repository they are rendering; before this, triage
+    resolved ROOT from __file__ while gate resolved its config from cwd, and
+    the same invocation could pair deaf's baseline paths with a default
+    identity.
     """
     explicit = os.environ.get(CONFIG_ENV)
     if explicit:
         return explicit
-    here = os.path.abspath(start or os.getcwd())
-    while True:
-        candidate = os.path.join(here, CONFIG_RELPATH)
-        if os.path.isfile(candidate):
-            return candidate
-        parent = os.path.dirname(here)
-        if parent == here:
-            return None
-        here = parent
+    anchors = []
+    if start is not None:
+        anchors.append(start)
+    anchors.append(os.getcwd())
+    anchors.append(os.path.dirname(os.path.abspath(__file__)))
+    for anchor in anchors:
+        here = os.path.abspath(anchor)
+        while True:
+            candidate = os.path.join(here, CONFIG_RELPATH)
+            if os.path.isfile(candidate):
+                return candidate
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
+    return None
 
 
 def load_config(path=None):

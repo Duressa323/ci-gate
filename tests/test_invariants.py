@@ -20,6 +20,7 @@ loud failure, never a silent fallback to another repository's identity.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -217,6 +218,54 @@ class ConfigContract(unittest.TestCase):
                 json.dump(doc, fh)
             self.assertEqual(gate.find_config(start=deep),
                              os.path.join(tmp, ".ci", "gate.config.json"))
+
+    def test_config_lookup_does_not_depend_on_the_working_directory(self):
+        """A gate invoked from the wrong directory must not render as unconfigured.
+
+        The regression this guards: find_config() walked up from os.getcwd()
+        only, so running the gate from anywhere but the repository root found
+        no config and fell through to DEFAULT_CONFIG -- "this repository" and
+        board "UNCONFIGURED" rendered into a PR comment that a reviewer has no
+        way to distinguish from a genuinely unconfigured gate.
+
+        A submodule makes this reachable rather than theoretical: the tool is
+        invoked as `python3 ci/gate/gate.py` from the repository root in CI,
+        but a developer running it from inside ci/gate/, from tests/, or via an
+        absolute path hits a different answer for the same repository.
+
+        Asserted through a subprocess, because CONFIG is resolved at import
+        time -- changing os.getcwd() inside this process would not re-run the
+        lookup, so the test would pass against the very bug it exists to catch.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, ".ci"))
+            os.makedirs(os.path.join(tmp, "ci", "gate"))
+            doc = dict(gate.DEFAULT_CONFIG)
+            doc.update({"display_name": "walked", "board": "walked-board",
+                        "rationale_before_you_start": "a",
+                        "rationale_comment_footer": "b"})
+            with open(os.path.join(tmp, ".ci", "gate.config.json"), "w") as fh:
+                json.dump(doc, fh)
+            # The tool is vendored at <tmp>/ci/gate, as the submodule places it.
+            shutil.copy(os.path.join(TOOL, "gate.py"),
+                        os.path.join(tmp, "ci", "gate", "gate.py"))
+
+            probe = ("import sys; sys.path.insert(0, %r); "
+                     "import gate; print(gate.CONFIG['board'])" %
+                     os.path.join(tmp, "ci", "gate"))
+            for cwd in (tmp, os.path.join(tmp, "ci", "gate"), "/"):
+                proc = subprocess.run([sys.executable, "-c", probe],
+                                      capture_output=True, text=True, cwd=cwd)
+                self.assertEqual(
+                    proc.returncode, 0,
+                    "gate failed to import from cwd=%s: %s"
+                    % (cwd, proc.stderr.strip()))
+                self.assertEqual(
+                    proc.stdout.strip(), "walked-board",
+                    "from cwd=%s the gate loaded board %r instead of the "
+                    "repository's own; it resolved its identity from the "
+                    "working directory rather than from where it lives"
+                    % (cwd, proc.stdout.strip()))
 
 
 if __name__ == "__main__":
