@@ -54,8 +54,34 @@ import os
 import shlex
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "ci"))
+def find_repo_root(start=None):
+    """
+    Walk up from this file to the directory that owns `.ci/`.
+
+    This module lives at `<repo>/ci/gate/triage.py` when consumed as a
+    submodule, and used to live at `<repo>/ci/triage.py` as a per-repo copy.
+    A fixed `dirname(dirname(...))` therefore resolves to `<repo>/ci` in one
+    layout and `<repo>` in the other, which would silently point
+    DEFAULT_BASELINE at a path that does not exist — and a triage run pointed
+    at a missing baseline reads as "no pre-existing findings", i.e. every
+    inherited finding reappears as new.
+
+    Anchoring on `.ci/` makes the tool independent of where it is vendored.
+    """
+    here = os.path.abspath(start or os.path.dirname(os.path.abspath(__file__)))
+    while True:
+        if os.path.isdir(os.path.join(here, ".ci")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            # No `.ci/` anywhere above: fall back to the parent of `ci/`,
+            # which is correct for a standalone checkout of this tool.
+            return os.path.dirname(here)
+        here = parent
+
+
+ROOT = find_repo_root()
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import gate  # noqa: E402  (path set above)
 
