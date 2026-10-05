@@ -1,0 +1,10 @@
+{
+  "board": "neural",
+  "comment_marker": "<!-- neural-analysis-gate -->",
+  "display_name": "NeuralForge",
+  "information_uri": "https://github.com/Duressa323/Neural",
+  "rationale_before_you_start": "Read `ci/TRIAGE.md`. `NeuralForge` is a Python build/train/serve platform, so **check the finding against\n`.ci/analysis-allowlist.json` first**: if this is a device-placement, dtype or checkpoint-path assumption that is correct by construction, it is a suppression\nwith a written justification, not a card. If you conclude that, add an entry\nwith `python3 ci/gate/triage.py allowlist` rather than \"fixing\" correct code.",
+  "rationale_comment_footer": "Reproduce with the gate's ruff/bandit/gitleaks/osv steps. Before acting, check\n`.ci/analysis-allowlist.json`: `NeuralForge` is a Python build/train/serve platform, and\ndevice placement, dtype and checkpoint-path assumptions can be correct by construction. If that is\nthe case here, suppress it with a justification instead of changing the code.",
+  "sarif_driver": "Neural-ci-gate",
+  "summary_footer": "`pytest tests/` runs the platform suite (config schema, checkpoints, inference launchers, quantisation, streaming) plus this pipeline's own guard tests. Static analysis covers what those tests do not reach."
+}

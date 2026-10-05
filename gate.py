@@ -209,13 +209,24 @@ def load_config(path=None):
 
     out = dict(DEFAULT_CONFIG)
     out.update(raw)
+
+    # Validate the keys the FILE actually carries, not the merged dict.  This
+    # check used to run against `out`, which meant DEFAULT_CONFIG silently
+    # satisfied six of the eight required keys: a config missing `display_name`
+    # or `board` loaded fine and the gate went on to render "this repository"
+    # and board "UNCONFIGURED" into a PR comment — the precise failure this
+    # function exists to prevent, reached by omitting a key instead of
+    # misspelling one.  The defaults remain for a missing FILE (standalone
+    # use); they must not paper over an incomplete one.
     missing = [k for k in REQUIRED_CONFIG_KEYS
-               if not str(out.get(k) or "").strip()]
+               if not str(raw.get(k) or "").strip()]
     if missing:
         raise ConfigError(
             "gate config %s is missing required key(s): %s\n"
-            "Every key must be a non-empty string; silence here would "
-            "render another repository's name into this one's PR comment."
+            "Every key must be present and a non-empty string; silence here "
+            "would render a placeholder, or another repository's identity, "
+            "into this one's PR comment. The built-in defaults are for a "
+            "missing config file, not an incomplete one."
             % (resolved, ", ".join(sorted(missing))))
 
     tools = out.get("expected_tools")

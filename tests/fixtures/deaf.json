@@ -1,0 +1,103 @@
+{
+  "BOARD": "deaf",
+  "GATE_DRIVER": "deaf-ci-gate",
+  "annotations": [
+    "::error file=src/x.c,line=42,title=nullPointer::Null pointer dereference: p",
+    "::error title=generic-api-key::hardcoded credential",
+    "::error file=src/y.c,line=7,title=unusedVariable::Unused variable: tmp"
+  ],
+  "card_body_new": "## deaf static-analysis finding: cppcheck / nullPointer\n\n**Severity:** error\n**Tool:** cppcheck\n**Rule id:** nullPointer\n**Findings in this group:** 1\n\nThis finding is introduced by the change under review. Per the decision rule in `ci/TRIAGE.md`, it gets its\nown card rather than being folded into the card currently in flight.\n\n### Locations\n\n- `src/x.c:42`\n\n- `src/x.c:42` — Null pointer dereference: p\n\n### Before you start\n\nRead `ci/TRIAGE.md`. `deaf` is fixed-point DSP, so **check the finding against\n`.ci/analysis-allowlist.json` first**: if this is a signed shift, deliberate\naliasing, or wraparound that is correct by construction, it is a suppression\nwith a written justification, not a card. If you conclude that, add an entry\nwith `python3 ci/triage.py allowlist` rather than \"fixing\" correct code.\n\nDo not add the finding to `.ci/analysis-baseline.json` to make CI green. The\nbaseline exists for findings reviewed and accepted; a real defect gets fixed.\n\n### Verification\n\n    make analyze\n",
+  "card_body_old": "## deaf static-analysis finding: cppcheck / nullPointer\n\n**Severity:** error\n**Tool:** cppcheck\n**Rule id:** nullPointer\n**Findings in this group:** 1\n\nThis finding is pre-existing and unrelated to the change under review. Per the decision rule in `ci/TRIAGE.md`, it gets its\nown card rather than being folded into the card currently in flight.\n\n### Locations\n\n- `src/x.c:42`\n\n- `src/x.c:42` — Null pointer dereference: p\n\n### Before you start\n\nRead `ci/TRIAGE.md`. `deaf` is fixed-point DSP, so **check the finding against\n`.ci/analysis-allowlist.json` first**: if this is a signed shift, deliberate\naliasing, or wraparound that is correct by construction, it is a suppression\nwith a written justification, not a card. If you conclude that, add an entry\nwith `python3 ci/triage.py allowlist` rather than \"fixing\" correct code.\n\nDo not add the finding to `.ci/analysis-baseline.json` to make CI green. The\nbaseline exists for findings reviewed and accepted; a real defect gets fixed.\n\n### Verification\n\n    make analyze\n",
+  "comment": "**New static-analysis finding — cppcheck / nullPointer (error)**\n\nIntroduced by this change, so per `ci/TRIAGE.md` it folds into this card rather\nthan becoming a new one.\n\n- `src/x.c:42`\n\n- `src/x.c:42` — Null pointer dereference: p\n\nReproduce with `make analyze`. Before acting, check\n`.ci/analysis-allowlist.json`: `deaf` is fixed-point DSP, and signed shifts,\ndeliberate aliasing and wraparound can be correct by construction. If that is\nthe case here, suppress it with a justification instead of changing the code.\n",
+  "doc_line2": "Aggregate static-analysis / secret-scanner / CVE-scanner output into one",
+  "sarif": {
+    "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+    "runs": [
+      {
+        "results": [
+          {
+            "level": "error",
+            "locations": [
+              {
+                "physicalLocation": {
+                  "artifactLocation": {
+                    "uri": "src/x.c"
+                  },
+                  "region": {
+                    "startLine": 42
+                  }
+                }
+              }
+            ],
+            "message": {
+              "text": "Null pointer dereference: p"
+            },
+            "ruleId": "cppcheck.nullPointer"
+          },
+          {
+            "level": "warning",
+            "locations": [
+              {
+                "physicalLocation": {
+                  "artifactLocation": {
+                    "uri": "src/y.c"
+                  },
+                  "region": {
+                    "startLine": 7
+                  }
+                }
+              }
+            ],
+            "message": {
+              "text": "Unused variable: tmp"
+            },
+            "ruleId": "cppcheck.unusedVariable"
+          },
+          {
+            "level": "error",
+            "locations": [],
+            "message": {
+              "text": "hardcoded credential"
+            },
+            "ruleId": "gitleaks.generic-api-key"
+          }
+        ],
+        "tool": {
+          "driver": {
+            "informationUri": "https://github.com/duressa-ship-it/deaf",
+            "name": "deaf-ci-gate",
+            "rules": [
+              {
+                "id": "cppcheck.nullPointer",
+                "shortDescription": {
+                  "text": "nullPointer"
+                }
+              },
+              {
+                "id": "cppcheck.unusedVariable",
+                "shortDescription": {
+                  "text": "unusedVariable"
+                }
+              },
+              {
+                "id": "gitleaks.generic-api-key",
+                "shortDescription": {
+                  "text": "generic-api-key"
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "version": "2.1.0"
+  },
+  "summary_clean": "## deaf static analysis — PASS\n\n`clang --analyze`, `cppcheck`, `gitleaks`, `trivy fs`, `osv-scanner`.\n\n| severity | findings |\n|---|---|\n| error | 0 |\n| warning | 0 |\n| note | 0 |\n| **total** | **0** |\n\nPre-existing (in `.ci/analysis-baseline.json`): **0**  \nNew: **0**\n\nNo findings. All four analyzers and both CVE scanners are clean.\n\n`make test` runs the DSP suite (biquad, crossover, compressor, spectrum, spatial, cancel) plus this pipeline's own tests. Static analysis covers what those tests do not reach.\n",
+  "summary_fail": "## deaf static analysis — FAIL\n\n`clang --analyze`, `cppcheck`, `gitleaks`, `trivy fs`, `osv-scanner`.\n\n| severity | findings |\n|---|---|\n| error | 2 |\n| warning | 1 |\n| note | 0 |\n| **total** | **3** |\n\nPre-existing (in `.ci/analysis-baseline.json`): **1**  \nNew: **2**\n\n### Pre-existing (baselined, justified)\n\n- `src/x.c:42` — cppcheck: Null pointer dereference: p  \n  _justification: reviewed 2026-10-04_\n\n### New — these fail the gate\n\n- `?:0` **error** `gitleaks` — hardcoded credential\n- `src/y.c:7` **warning** `cppcheck` — Unused variable: tmp\n\n### Analyzers that did not report\n\nThese produced no report, so this verdict does **not** cover them:\n\n- `trivy` — no report collected\n\n`make test` runs the DSP suite (biquad, crossover, compressor, spectrum, spatial, cancel) plus this pipeline's own tests. Static analysis covers what those tests do not reach.\n",
+  "summary_pass": "## deaf static analysis — PASS\n\n`clang --analyze`, `cppcheck`, `gitleaks`, `trivy fs`, `osv-scanner`.\n\n| severity | findings |\n|---|---|\n| error | 2 |\n| warning | 1 |\n| note | 0 |\n| **total** | **3** |\n\nPre-existing (in `.ci/analysis-baseline.json`): **1**  \nNew: **2**\n\n### Pre-existing (baselined, justified)\n\n- `src/x.c:42` — cppcheck: Null pointer dereference: p  \n  _justification: reviewed 2026-10-04_\n\n### New — these fail the gate\n\n- `?:0` **error** `gitleaks` — hardcoded credential\n- `src/y.c:7` **warning** `cppcheck` — Unused variable: tmp\n\n`make test` runs the DSP suite (biquad, crossover, compressor, spectrum, spatial, cancel) plus this pipeline's own tests. Static analysis covers what those tests do not reach.\n",
+  "titles": [
+    "deaf: cppcheck nullPointer in src/x.c",
+    "deaf: gitleaks generic-api-key in no location reported",
+    "deaf: cppcheck unclassified in no location reported"
+  ]
+}

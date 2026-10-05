@@ -13,15 +13,44 @@ sentence is a silent behaviour change in all four repos at once.
 
 So this harness does not assert anything about the shared tool.  It captures
 the output of BOTH implementations, from the same fixture, in separate
-subprocesses, and diffs the bytes.  A difference fails.  The fixtures are
-committed under tests/fixtures/ so the comparison is reproducible on a clean
-checkout with no analyzers installed.
+subprocesses, and diffs the bytes.  A difference fails.  The golden files under
+tests/fixtures/ are the captured output of each repository's PRE-MIGRATION
+copy, so the comparison is against independently-produced truth rather than
+against this tool's own current behaviour — a golden regenerated from the
+shared tool would agree with it by construction and prove nothing.
 
-    python3 tests/test_parity.py --reference-dir /path/to/pristine/copies
+    python3 tests/test_parity.py                    # golden mode (the default)
+    python3 tests/test_parity.py --reference-dir D  # re-derive from live copies
 
-`--reference-dir` holds one subdirectory per repository, each containing that
-repository's pre-migration gate.py / triage.py / post_summary.py.  Repositories
-whose directory is absent are skipped, so a partial checkout still runs.
+Two modes, because the goldens and the original copies answer different
+questions:
+
+* **Golden mode** (default, runs with no arguments, in CI).  Compares the
+  shared tool's render against tests/fixtures/<repo>.json.  This is the check
+  that must never be skipped: it is what stops a future edit to gate.py or to
+  a repository's config from changing rendered output unnoticed.
+
+* **Reference mode** (`--reference-dir`).  Recomputes the same comparison
+  directly from a checkout of the original per-repo copies.  Those copies are
+  gone from the consuming repositories, so this is how the goldens are audited
+  and re-derived; it needs the originals and is not available from a submodule
+  checkout.
+
+Intentional deviations
+----------------------
+The migration was not a pure refactor.  Every deviation recorded in
+ALLOWED_DEVIATIONS below corrects rendered output that the copy-paste had got
+wrong for that repository; each is reviewed and carries its reason.  The
+allowlist is the audit trail: a NEW difference fails, and an entry that no
+longer applies fails too, so neither a regression nor a silent "fix" can pass
+unnoticed.
+
+This replaces an earlier version of this test that skipped unless
+`--reference-dir` was passed.  Its docstring claimed fixtures were committed
+under tests/fixtures/; that directory did not exist, so the test skipped on
+every run — including in CI — and parity was never actually proven.  Golden
+mode exists so that the default invocation is a real check rather than a green
+skip.
 """
 
 import argparse
@@ -35,6 +64,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.dirname(HERE)
+FIXTURES = os.path.join(HERE, "fixtures")
 
 # Rendered by importing the implementation under test and calling its own
 # public functions with a fixed finding, so the probe exercises the real code
@@ -88,6 +118,60 @@ out = {
 print(json.dumps(out, sort_keys=True, indent=2))
 '''
 
+# ---------------------------------------------------------------------------
+# Reviewed deviations from each repository's pre-migration output.
+#
+# Read this table as the changelog of the migration's behaviour changes: every
+# entry is a correction of output the copy-paste had got wrong for that
+# repository, and nothing outside this table may differ.
+# ---------------------------------------------------------------------------
+ALLOWED_DEVIATIONS = {
+    "deaf": {
+        # The card body told the reader to run `python3 ci/triage.py allowlist`.
+        # The migration moved the tool to ci/gate/triage.py, so the old path
+        # was a dead command in an instruction a human follows verbatim.
+        "card_body_new": "dead ci/triage.py path -> ci/gate/triage.py",
+        "card_body_old": "dead ci/triage.py path -> ci/gate/triage.py",
+    },
+    "elimination": {
+        # elimination's own copy already carried a rewritten rationale specific
+        # to a C99 + ncurses grid game.  That is preserved here as this repo's
+        # override rather than flattened into shared code, and the summary
+        # footer describes elimination's tests/ instead of deaf's DSP suite.
+        "card_body_new": "preserve elimination's grid-game rationale",
+        "card_body_old": "preserve elimination's grid-game rationale",
+        "comment": "preserve elimination's grid-game rationale",
+        "summary_clean": "footer describes elimination's tests/, not deaf's DSP suite",
+        "summary_fail": "footer describes elimination's tests/, not deaf's DSP suite",
+        "summary_pass": "footer describes elimination's tests/, not deaf's DSP suite",
+    },
+    "mouse": {
+        # mouse is a stdlib-only Python Tkinter app with no Makefile and no DSP
+        # suite, so the inherited footer described tests it does not have.  The
+        # path fix matches deaf's entry above.
+        "card_body_new": "dead ci/triage.py path -> ci/gate/triage.py",
+        "card_body_old": "dead ci/triage.py path -> ci/gate/triage.py",
+        "summary_clean": "footer describes mouse's guard tests, not deaf's DSP suite",
+        "summary_fail": "footer describes mouse's guard tests, not deaf's DSP suite",
+        "summary_pass": "footer describes mouse's guard tests, not deaf's DSP suite",
+    },
+    "neural": {
+        # The worst of the four: neural's config was deaf's verbatim, so it
+        # carried deaf's sticky comment marker (two repositories sharing one
+        # marker collide on a single PR comment), deaf's C/DSP suite and
+        # `make test` in a Python repository that has neither, and deaf's
+        # signed-shift/aliasing rationale for a neural-network platform.
+        "card_body_new": "neural's own domain rationale, not deaf's DSP rationale",
+        "card_body_old": "neural's own domain rationale, not deaf's DSP rationale",
+        "comment": "neural's own reproduce step and domain rationale",
+        "summary_clean": "footer describes pytest tests/, not deaf's DSP suite",
+        "summary_fail": "footer describes pytest tests/, not deaf's DSP suite",
+        "summary_pass": "footer describes pytest tests/, not deaf's DSP suite",
+    },
+}
+
+REPOS = ("deaf", "elimination", "mouse", "neural")
+
 
 def run_probe(ci_dir, config=None):
     """Run the probe against one implementation; return parsed JSON or raise."""
@@ -107,9 +191,52 @@ def run_probe(ci_dir, config=None):
     return json.loads(proc.stdout)
 
 
-class ParityTest(unittest.TestCase):
-    REPOS = ("deaf", "elimination", "mouse", "neural")
+def live_config_dir():
+    """The `.ci/` directory of the repository this checkout sits in, if any."""
+    here = os.path.dirname(TOOL)
+    for base in (here, os.path.dirname(here)):
+        path = os.path.join(base, ".ci", "gate.config.json")
+        if os.path.isfile(path):
+            return os.path.dirname(path)
+    return None
 
+
+def config_for(repo):
+    """The config to render `repo` with.
+
+    The live repository config when this test runs inside a consuming
+    repository (the submodule sits at <repo>/ci/gate, so the config is two
+    levels up).  The committed fixture copy otherwise, which is what makes
+    golden mode work from a bare checkout of ci-gate with no repository
+    around it.  test_live_configs_match_fixtures keeps the two from drifting.
+    """
+    here = os.path.dirname(TOOL)
+    for base in (here, os.path.dirname(here)):
+        path = os.path.join(base, ".ci", "gate.config.json")
+        if os.path.isfile(path):
+            return path
+    return os.path.join(FIXTURES, repo + ".config.json")
+
+
+def diff_fields(before, after):
+    return sorted(k for k in set(before) | set(after)
+                  if before.get(k) != after.get(k))
+
+
+def _diff_text(repo, before, after, fields):
+    out = []
+    for key in fields:
+        out.append("  field %r:" % key)
+        out += list(difflib.unified_diff(
+            (before.get(key) or "").split("\n"),
+            (after.get(key) or "").split("\n"),
+            fromfile="before (per-repo %s)" % repo,
+            tofile="after (shared tool)",
+            lineterm=""))[:40]
+    return out
+
+
+class ParityTest(unittest.TestCase):
     def setUp(self):
         # unittest.main() strips the --reference-dir flag before building the
         # suite, so it is read out of sys.argv here rather than re-parsed.
@@ -119,56 +246,100 @@ class ParityTest(unittest.TestCase):
         known, _ = parser.parse_known_args()
         self.reference_dir = known.reference_dir
 
-    def reference_for(self, repo):
+    def assert_no_unreviewed_drift(self, repo, before, after):
+        """Shared fields must match; differing fields must be allowlisted."""
+        allowed = ALLOWED_DEVIATIONS.get(repo, {})
+        actual = diff_fields(before, after)
+
+        unexpected = [f for f in actual if f not in allowed]
+        stale = [f for f in sorted(allowed) if f not in actual]
+        if unexpected or stale:
+            self.fail(
+                "unreviewed parity drift in %s\n"
+                "  changed but not allowlisted: %s\n"
+                "  allowlisted but unchanged:   %s\n"
+                "A changed field must be diffed by hand and added to "
+                "ALLOWED_DEVIATIONS with a reason; an entry that no longer "
+                "applies must be removed. Otherwise neither a regression nor a "
+                "silent change can pass unnoticed.\n\n%s"
+                % (repo, unexpected, stale,
+                   "\n".join(_diff_text(repo, before, after, actual))))
+
+    # -- golden mode: the default, and what CI runs ------------------------
+
+    def test_golden_fixtures_exist_for_every_repo(self):
+        """No repo may silently lose its parity coverage."""
+        missing = [r for r in REPOS
+                   if not os.path.isfile(os.path.join(FIXTURES, r + ".json"))]
+        self.assertEqual(missing, [],
+                         "no golden fixture for %s — parity would silently "
+                         "stop being checked for that repo" % (missing,))
+
+    def test_shared_tool_matches_golden_for_every_repo(self):
+        checked = []
+        for repo in REPOS:
+            golden_path = os.path.join(FIXTURES, repo + ".json")
+            if not os.path.isfile(golden_path):
+                continue
+            with self.subTest(repo=repo):
+                with open(golden_path, encoding="utf-8") as fh:
+                    golden = json.load(fh)
+                after = run_probe(TOOL, config=config_for(repo))
+                self.assert_no_unreviewed_drift(repo, golden, after)
+                checked.append(repo)
+        self.assertEqual(sorted(checked), sorted(REPOS),
+                         "golden mode compared %d of %d repos; a parity test "
+                         "that quietly checks nothing is a false green"
+                         % (len(checked), len(REPOS)))
+
+    # -- reference mode: re-derive the goldens from the original copies ----
+
+    def test_shared_tool_matches_reference_copies(self):
+        """Compare against live pre-migration copies, where available."""
         if not self.reference_dir:
             self.skipTest("no --reference-dir given")
-        path = os.path.join(self.reference_dir, repo)
-        if not os.path.isdir(path):
-            self.skipTest("no reference copy for %s" % repo)
-        return path
-
-    def test_shared_tool_matches_every_repo(self):
-        """Each repo's rendered output == its own pre-migration copy."""
-        checked, skipped = [], []
-        for repo in self.REPOS:
-            ref = self.reference_for(repo)
+        compared = []
+        for repo in REPOS:
+            ref = os.path.join(self.reference_dir, repo)
+            if not os.path.isdir(ref):
+                continue
             with self.subTest(repo=repo):
                 before = run_probe(os.path.join(ref, "ci"))
-                config = os.path.join(ref, ".ci", "gate.config.json")
-                self.assertTrue(os.path.isfile(config),
-                                "%s has no .ci/gate.config.json" % repo)
-                after = run_probe(TOOL, config=config)
+                after = run_probe(TOOL, config=config_for(repo))
+                self.assert_no_unreviewed_drift(repo, before, after)
+                compared.append(repo)
+        self.assertTrue(compared, "no reference copies were actually compared")
 
-                if before == after:
-                    checked.append(repo)
-                    continue
+    def test_goldens_still_match_the_reference_copies(self):
+        """A stale golden is worse than none: it would bless a regression."""
+        if not self.reference_dir:
+            self.skipTest("no --reference-dir given")
+        checked = []
+        for repo in REPOS:
+            ref = os.path.join(self.reference_dir, repo)
+            golden_path = os.path.join(FIXTURES, repo + ".json")
+            if not (os.path.isdir(ref) and os.path.isfile(golden_path)):
+                continue
+            with self.subTest(repo=repo):
+                with open(golden_path, encoding="utf-8") as fh:
+                    golden = json.load(fh)
+                fresh = run_probe(os.path.join(ref, "ci"))
+                self.assertEqual(
+                    diff_fields(golden, fresh), [],
+                    "tests/fixtures/%s.json no longer matches %s's "
+                    "pre-migration output, so the golden is stale and would "
+                    "bless a regression" % (repo, repo))
+                checked.append(repo)
+        self.assertTrue(checked)
 
-                # Name every field that moved, then show one diff: a bare
-                # assertEqual on a 400-line JSON blob reports "differ" and
-                # leaves the reader to find the changed string themselves.
-                diffs = [k for k in before if before[k] != after.get(k)]
-                detail = []
-                for key in diffs:
-                    detail.append("  field %r:" % key)
-                    detail += list(difflib.unified_diff(
-                        before[key].split("\n"),
-                        after.get(key, "").split("\n"),
-                        fromfile="before (per-repo %s)" % repo,
-                        tofile="after (shared tool)",
-                        lineterm=""))[:40]
-                skipped.append(repo)
-                self.fail("output drift in %d field(s) for %s:\n%s"
-                          % (len(diffs), repo, "\n".join(detail)))
-        self.assertTrue(checked or not skipped,
-                        "no repository was actually compared")
+    # -- the config contract ----------------------------------------------
 
     def test_no_shared_logic_in_configs(self):
         """A config carries identity and prose, never code."""
-        for repo in self.REPOS:
-            ref = self.reference_for(repo)
-            config = os.path.join(ref, ".ci", "gate.config.json")
-            self.assertTrue(os.path.isfile(config), config)
-            with open(config, encoding="utf-8") as fh:
+        for repo in REPOS:
+            path = os.path.join(FIXTURES, repo + ".config.json")
+            self.assertTrue(os.path.isfile(path), path)
+            with open(path, encoding="utf-8") as fh:
                 doc = json.load(fh)
             allowed = set(gate_keys())
             self.assertEqual(
@@ -179,25 +350,153 @@ class ParityTest(unittest.TestCase):
                 self.assertTrue(str(doc.get(key) or "").strip(),
                                 "%s config is missing %s" % (repo, key))
 
+    def test_live_configs_match_fixtures(self):
+        """A consuming repo's config must equal the fixture it is pinned with.
+
+        Skipped in a bare ci-gate checkout, where there is no live config.  In a
+        consuming repository this is what catches a config edited without
+        regenerating the golden: the drift shows up here rather than as a
+        mystery in whichever repo's PR comment changes shape first.
+        """
+        live = live_config_dir()
+        if not live:
+            self.skipTest("no live .ci/gate.config.json; not inside a "
+                          "consuming repository")
+        for repo in REPOS:
+            path = os.path.join(live, "gate.config.json")
+            if not os.path.isfile(path):
+                self.skipTest("no live config in %s" % live)
+            with open(path, encoding="utf-8") as fh:
+                doc = json.load(fh)
+            with open(os.path.join(FIXTURES, repo + ".config.json"),
+                      encoding="utf-8") as fh:
+                fixture = json.load(fh)
+            # _comment is repository-local documentation, not tool input.
+            doc = {k: v for k, v in doc.items() if k != "_comment"}
+            self.assertEqual(
+                doc, fixture,
+                "%s's live .ci/gate.config.json differs from the committed "
+                "fixture. Re-derive the fixture after reviewing the diff."
+                % repo)
+
+    def test_required_keys_cannot_be_silently_weakened(self):
+        """Pin the required-key set itself.
+
+        gate.DEFAULT_CONFIG supplies a value for every key, so deleting an
+        entry from REQUIRED_CONFIG_KEYS makes an incomplete config load
+        successfully instead of aborting — the config contract silently stops
+        holding, and nothing else in the suite notices: the fixtures are all
+        complete, so both config checks still pass.  Asserting the exact set
+        here is what makes that mutation fail.
+
+        The expected set is duplicated on purpose.  Reading it back out of
+        gate.REQUIRED_CONFIG_KEYS would compare the constant with itself and
+        pass no matter what it contained.
+        """
+        self.assertEqual(
+            sorted(load_gate().REQUIRED_CONFIG_KEYS),
+            ["board", "comment_marker", "display_name", "information_uri",
+             "rationale_before_you_start", "rationale_comment_footer",
+             "sarif_driver", "summary_footer"],
+            "REQUIRED_CONFIG_KEYS changed; every key here must abort the run "
+            "when absent, because the gate would otherwise render a "
+            "placeholder or another repository's identity into a PR comment")
+
+    def test_defaults_are_obvious_placeholders(self):
+        """Each built-in default must announce itself as unconfigured.
+
+        The defaults exist for one case: running the tool with no config file
+        at all.  They must never be a plausible-looking value, because that is
+        what made the `raw`-vs-`out` bug hard to see — "UNCONFIGURED" for the
+        board reads as a sentinel, but a real-looking driver name or URL reads
+        as a working configuration.
+
+        Every repository supplies all eight keys, so no test can observe these
+        values through normal use; asserting them here is what stops a default
+        from drifting into something that looks legitimate.
+        """
+        defaults = load_gate().DEFAULT_CONFIG
+
+        # Exact values, asserted individually.  An earlier version of this test
+        # looked for placeholder *substrings* ("UNCONFIGURED", "CI-GATE", ...)
+        # and a mutation setting sarif_driver to "MUTANT-ci-gate" satisfied the
+        # substring check while being no placeholder at all — the test passed on
+        # exactly the value it exists to reject.  Each value is pinned instead.
+        self.assertEqual(defaults["display_name"], "this repository")
+        self.assertEqual(defaults["board"], "UNCONFIGURED")
+        self.assertEqual(defaults["sarif_driver"], "ci-gate")
+        self.assertEqual(defaults["information_uri"],
+                         "https://example.invalid/ci-gate")
+        self.assertEqual(defaults["comment_marker"], "<!-- ci-gate-analysis -->")
+        self.assertTrue(
+            defaults["summary_footer"].startswith("UNCONFIGURED:"),
+            "DEFAULT_CONFIG['summary_footer'] must announce itself as "
+            "unconfigured; got %r" % defaults["summary_footer"])
+        # The two rationale keys are None on purpose: "{x}".format(x=None)
+        # renders the literal string "None" into a card body, so an empty
+        # default is the only safe placeholder for a value that is interpolated
+        # into an instruction a reviewer may follow.
+        for key in ("rationale_before_you_start", "rationale_comment_footer"):
+            self.assertIsNone(
+                defaults[key],
+                "DEFAULT_CONFIG[%r] must be None; a string here renders into a "
+                "card body as if it were this repository's own guidance"
+                % key)
+
+    def test_no_default_can_mask_a_missing_required_key(self):
+        """A config missing one required key must abort, key by key.
+
+        Proves the guarantee above end to end: for each required key, delete it
+        from an otherwise-complete config and assert the load raises.  This is
+        the property the defaults could otherwise hide.
+        """
+        gate = load_gate()
+        with tempfile.TemporaryDirectory() as tmp:
+            for key in gate.REQUIRED_CONFIG_KEYS:
+                doc = dict(gate.DEFAULT_CONFIG)
+                doc.update({"rationale_before_you_start": "a",
+                            "rationale_comment_footer": "b"})
+                doc.pop(key)
+                path = os.path.join(tmp, "gate.config.json")
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump(doc, fh)
+                with self.assertRaises(
+                        SystemExit,
+                        msg="config missing %r loaded successfully because "
+                            "DEFAULT_CONFIG supplied a fallback for it" % key):
+                    gate.load_config(path)
+
+    def test_allowlist_covers_exactly_the_known_repos(self):
+        """A stale entry for a renamed repo must not pass silently."""
+        self.assertEqual(sorted(ALLOWED_DEVIATIONS), sorted(REPOS))
+        for repo, fields in ALLOWED_DEVIATIONS.items():
+            self.assertTrue(
+                all(isinstance(v, str) and v.strip() for v in fields.values()),
+                "%s has an allowlist entry with no reason recorded" % repo)
+
+
+def load_gate():
+    """Import the tool's gate module from the tool directory, not from cwd.
+
+    A cached import would be a hazard here: the parity tests mutate nothing,
+    but a stale sys.modules entry from an earlier sys.path would make these
+    assertions test a different copy of the code than the one being shipped.
+    """
+    if TOOL not in sys.path:
+        sys.path.insert(0, TOOL)
+    import gate
+    return gate
+
 
 def gate_keys():
     """Ask the tool itself which keys exist, so the test cannot drift."""
-    sys.path.insert(0, TOOL)
-    try:
-        import gate
-        return (set(gate.DEFAULT_CONFIG) | set(gate.REQUIRED_CONFIG_KEYS)
-                | {"_comment"})
-    finally:
-        sys.path.remove(TOOL)
+    gate = load_gate()
+    return (set(gate.DEFAULT_CONFIG) | set(gate.REQUIRED_CONFIG_KEYS)
+            | {"_comment"})
 
 
 def required_keys():
-    sys.path.insert(0, TOOL)
-    try:
-        import gate
-        return set(gate.REQUIRED_CONFIG_KEYS)
-    finally:
-        sys.path.remove(TOOL)
+    return set(load_gate().REQUIRED_CONFIG_KEYS)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+{
+  "board": "elimination",
+  "comment_marker": "<!-- elimination-analysis-gate -->",
+  "display_name": "Elimination",
+  "information_uri": "https://github.com/Duressa323/elimination",
+  "rationale_before_you_start": "Read `ci/TRIAGE.md`. `elimination` is a C99 + ncurses grid game, so **check the finding against\n`.ci/analysis-allowlist.json` first**: if this is a board-bounds or\nadjacency-walk assumption that is correct by construction, it is a suppression\nwith a written justification, not a card. If you conclude that, add an entry\nwith `python3 ci/gate/triage.py allowlist` rather than \"fixing\" correct code.",
+  "rationale_comment_footer": "Reproduce with `make analyze`. Before acting, check\n`.ci/analysis-allowlist.json`: `elimination` is a C99 + ncurses grid game, and\nboard-bounds and adjacency assumptions can be correct by construction. If that is\nthe case here, suppress it with a justification instead of changing the code.",
+  "sarif_driver": "elimination-ci-gate",
+  "summary_footer": "`tests/` validates the analysis pipeline's own configuration — the baseline and allowlist must stay well-formed and every suppression must stay justified. Static analysis covers what those checks do not reach: memory errors, unchecked returns and dead code on paths no test exercises."
+}

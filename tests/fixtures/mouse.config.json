@@ -1,0 +1,16 @@
+{
+  "board": "mouse",
+  "comment_marker": "<!-- mouse-analysis-gate -->",
+  "display_name": "Mouse",
+  "expected_tools": [
+    "ruff",
+    "bandit",
+    "gitleaks",
+    "osv-scanner"
+  ],
+  "information_uri": "https://github.com/Duressa323/mouse",
+  "rationale_before_you_start": "Read `ci/TRIAGE.md`. `Mouse` is a stdlib-only Python entropy collector, so **check the finding against\n`.ci/analysis-allowlist.json` first**: if this is a signed shift, deliberate\naliasing, or wraparound that is correct by construction, it is a suppression\nwith a written justification, not a card. If you conclude that, add an entry\nwith `python3 ci/gate/triage.py allowlist` rather than \"fixing\" correct code.",
+  "rationale_comment_footer": "Reproduce with `make analyze`. Before acting, check\n`.ci/analysis-allowlist.json`: `Mouse` is a stdlib-only Python entropy collector, and\ndeliberate aliasing and wraparound can be correct by construction. If that is\nthe case here, suppress it with a justification instead of changing the code.",
+  "sarif_driver": "mouse-ci-gate",
+  "summary_footer": "This repository has no test suite and no Makefile: `main.py` is a\nsingle Tkinter module and its only automated coverage is this analysis pipeline\nplus the guard tests in `tests/`. Static analysis is therefore the whole of the\nsignal here, which is why the gate fails closed when an analyzer does not\nreport."
+}

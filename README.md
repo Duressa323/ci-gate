@@ -21,22 +21,30 @@ four-way manual port and the copies drifted apart silently.
 
 Each repository adds this directory as a **git submodule** pinned to a commit:
 
-    git submodule add https://github.com/Duressa323/ci-gate-public.git ci/gate
+    git submodule add https://github.com/Duressa323/ci-gate.git ci/gate
 
 and carries its identity in `.ci/gate.config.json`:
 
 ```json
 {
-  "display_name": "deaf",
-  "board": "deaf",
-  "sarif_driver": "deaf-ci-gate",
-  "information_uri": "https://github.com/duressa-ship-it/deaf",
-  "comment_marker": "<!-- deaf-analysis-gate -->",
-  "summary_footer": "`make test` runs the DSP suite ...",
+  "display_name": "Example",
+  "board": "example",
+  "sarif_driver": "example-ci-gate",
+  "information_uri": "https://github.com/your-org/example",
+  "comment_marker": "<!-- example-analysis-gate -->",
+  "summary_footer": "`<test command>` runs ... so static analysis covers ...",
   "rationale_before_you_start": "Read `ci/TRIAGE.md`. ...",
   "rationale_comment_footer": "Reproduce with `make analyze`. ..."
 }
 ```
+
+Every value above is per-repository and **must** be written for the repository
+that owns the config. The pre-migration copies were derived from `deaf`, and
+carrying `deaf`'s values across verbatim put its sticky comment marker and its
+C/DSP test description into three unrelated repositories — two of which are
+Python. `comment_marker` is a sticky-comment selector: two repositories sharing
+one marker collide on a single PR comment. See each repository's
+`.ci/gate.config.json` `_comment` for what was corrected.
 
 The config is found by walking up from the working directory, or set explicitly
 with `$GATE_CONFIG`. Every key in `gate.REQUIRED_CONFIG_KEYS` must be a non-empty
