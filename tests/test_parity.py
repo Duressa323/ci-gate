@@ -192,30 +192,73 @@ def run_probe(ci_dir, config=None):
 
 
 def live_config_dir():
-    """The `.ci/` directory of the repository this checkout sits in, if any."""
-    here = os.path.dirname(TOOL)
-    for base in (here, os.path.dirname(here)):
-        path = os.path.join(base, ".ci", "gate.config.json")
-        if os.path.isfile(path):
-            return os.path.dirname(path)
+    """The `.ci/` directory of the repository this run sits inside, if any.
+
+    Searches upward from the tool checkout AND from the working directory.
+    The tool's own location is not enough: the common invocation is
+    `cd <repo> && python3 ci/gate/tests/test_parity.py`, where the submodule
+    under test is <repo>/ci/gate and the config is two levels above it -- but
+    a developer auditing a checkout may equally run the canonical copy from
+    elsewhere with the repository as their cwd, in which case the only
+    `.ci/` reachable is the one under the cwd.  Anchoring on cwd alone was the
+    earlier failure: this suite reported "not inside a consuming repository"
+    and skipped the one check that ties a live config to its golden.
+    """
+    seen = []
+    for base in (os.path.dirname(TOOL), os.getcwd()):
+        here = os.path.abspath(base)
+        while True:
+            if here in seen:
+                break
+            seen.append(here)
+            path = os.path.join(here, ".ci", "gate.config.json")
+            if os.path.isfile(path):
+                return os.path.dirname(path)
+            parent = os.path.dirname(here)
+            if parent == here:
+                break
+            here = parent
     return None
 
 
 def config_for(repo):
     """The config to render `repo` with.
 
-    The live repository config when this test runs inside a consuming
-    repository (the submodule sits at <repo>/ci/gate, so the config is two
-    levels up).  The committed fixture copy otherwise, which is what makes
-    golden mode work from a bare checkout of ci-gate with no repository
-    around it.  test_live_configs_match_fixtures keeps the two from drifting.
+    The fixture copy in tests/fixtures/, except when `repo` is the repository
+    this test is running inside -- then its live config, so an edit to a
+    consuming repository's identity is checked against its golden rather than
+    only against the fixture.
+
+    The earlier version returned the live config for EVERY repo whenever it
+    found one, so running this suite from inside deaf rendered all four
+    repositories with deaf's identity.  Three of them then differed from their
+    goldens for a reason that had nothing to do with the code under test, and
+    the failures pointed at the wrong cause.  The fixture is the default
+    precisely because it is per-repo and always present; the live config
+    substitutes only for the one repo that owns it.
     """
-    here = os.path.dirname(TOOL)
-    for base in (here, os.path.dirname(here)):
-        path = os.path.join(base, ".ci", "gate.config.json")
-        if os.path.isfile(path):
-            return path
+    if repo == live_repo_name():
+        live = live_config_dir()
+        if live:
+            return os.path.join(live, "gate.config.json")
     return os.path.join(FIXTURES, repo + ".config.json")
+
+
+def live_repo_name():
+    """The name of the consuming repository this checkout sits inside, or None.
+
+    Derived from the live config's own `board`, which is the one field every
+    repository must set and the one the gate renders verbatim, rather than from
+    the directory name: a checkout may be cloned under any name.
+    """
+    live = live_config_dir()
+    if not live:
+        return None
+    try:
+        with open(os.path.join(live, "gate.config.json"), encoding="utf-8") as fh:
+            return str(json.load(fh).get("board") or "") or None
+    except (OSError, ValueError):
+        return None
 
 
 def diff_fields(before, after):
@@ -224,15 +267,26 @@ def diff_fields(before, after):
 
 
 def _diff_text(repo, before, after, fields):
+    """A readable diff of the fields that changed.
+
+    Renders each side as sorted JSON rather than splitting on newlines: the
+    probe's `sarif` field is a nested object, not a string, so a text diff
+    raised AttributeError and replaced a real parity failure with a crash in
+    the failure reporter -- hiding the very drift the test exists to report.
+    """
     out = []
     for key in fields:
         out.append("  field %r:" % key)
-        out += list(difflib.unified_diff(
-            (before.get(key) or "").split("\n"),
-            (after.get(key) or "").split("\n"),
-            fromfile="before (per-repo %s)" % repo,
-            tofile="after (shared tool)",
-            lineterm=""))[:40]
+        old, new = before.get(key), after.get(key)
+        if isinstance(old, str) and isinstance(new, str):
+            out += list(difflib.unified_diff(
+                old.split("\n"), new.split("\n"),
+                fromfile="before (per-repo %s)" % repo,
+                tofile="after (shared tool)",
+                lineterm=""))[:40]
+        else:
+            out += ["    before: " + json.dumps(old, sort_keys=True)[:600],
+                    "    after : " + json.dumps(new, sort_keys=True)[:600]]
     return out
 
 
@@ -362,22 +416,24 @@ class ParityTest(unittest.TestCase):
         if not live:
             self.skipTest("no live .ci/gate.config.json; not inside a "
                           "consuming repository")
-        for repo in REPOS:
-            path = os.path.join(live, "gate.config.json")
-            if not os.path.isfile(path):
-                self.skipTest("no live config in %s" % live)
-            with open(path, encoding="utf-8") as fh:
-                doc = json.load(fh)
-            with open(os.path.join(FIXTURES, repo + ".config.json"),
-                      encoding="utf-8") as fh:
-                fixture = json.load(fh)
-            # _comment is repository-local documentation, not tool input.
-            doc = {k: v for k, v in doc.items() if k != "_comment"}
-            self.assertEqual(
-                doc, fixture,
-                "%s's live .ci/gate.config.json differs from the committed "
-                "fixture. Re-derive the fixture after reviewing the diff."
-                % repo)
+        repo = live_repo_name()
+        if repo not in REPOS:
+            self.skipTest("live config declares board=%r, which is not one of "
+                          "the repositories this suite knows: %s"
+                          % (repo, list(REPOS)))
+        path = os.path.join(live, "gate.config.json")
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        with open(os.path.join(FIXTURES, repo + ".config.json"),
+                  encoding="utf-8") as fh:
+            fixture = json.load(fh)
+        # _comment is repository-local documentation, not tool input.
+        doc = {k: v for k, v in doc.items() if k != "_comment"}
+        self.assertEqual(
+            doc, fixture,
+            "%s's live .ci/gate.config.json differs from the committed "
+            "fixture. Re-derive the fixture after reviewing the diff."
+            % repo)
 
     def test_required_keys_cannot_be_silently_weakened(self):
         """Pin the required-key set itself.
