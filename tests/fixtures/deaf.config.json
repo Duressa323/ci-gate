@@ -2,7 +2,7 @@
   "board": "deaf",
   "comment_marker": "<!-- deaf-analysis-gate -->",
   "display_name": "deaf",
-  "information_uri": "https://github.com/duressa-ship-it/deaf",
+  "information_uri": "https://github.com/Duressa323/deaf",
   "rationale_before_you_start": "Read `ci/TRIAGE.md`. `deaf` is fixed-point DSP, so **check the finding against\n`.ci/analysis-allowlist.json` first**: if this is a signed shift, deliberate\naliasing, or wraparound that is correct by construction, it is a suppression\nwith a written justification, not a card. If you conclude that, add an entry\nwith `python3 ci/gate/triage.py allowlist` rather than \"fixing\" correct code.",
   "rationale_comment_footer": "Reproduce with `make analyze`. Before acting, check\n`.ci/analysis-allowlist.json`: `deaf` is fixed-point DSP, and signed shifts,\ndeliberate aliasing and wraparound can be correct by construction. If that is\nthe case here, suppress it with a justification instead of changing the code.",
   "sarif_driver": "deaf-ci-gate",

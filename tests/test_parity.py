@@ -145,17 +145,6 @@ print(json.dumps(out, sort_keys=True, indent=2))
 # ---------------------------------------------------------------------------
 ALLOWED_DEVIATIONS = {
     "deaf": {
-        # The card body told the reader to run `python3 ci/triage.py allowlist`.
-        # The migration moved the tool to ci/gate/triage.py, so the old path
-        # was a dead command in a human-followed instruction.
-        "card_body_new": (
-            "dead ci/triage.py path -> ci/gate/triage.py",
-            "d30c834b3d56382e",
-            "7c61e0d90bead585"),
-        "card_body_old": (
-            "dead ci/triage.py path -> ci/gate/triage.py",
-            "4bb17b3c78251efc",
-            "a40f96e87fca19b7"),
     },
     "elimination": {
         # elimination's own copy already carried a rewritten rationale specific
