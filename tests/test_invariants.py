@@ -20,6 +20,7 @@ loud failure, never a silent fallback to another repository's identity.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,7 @@ TOOL = os.path.dirname(HERE)
 sys.path.insert(0, TOOL)
 
 import gate  # noqa: E402
+import triage  # noqa: E402  (imports gate; shares the identity config)
 
 
 class ContentHashKeying(unittest.TestCase):
@@ -410,6 +412,117 @@ class ConfigContract(unittest.TestCase):
                     "repository's own; it resolved its identity from the "
                     "working directory rather than from where it lives"
                     % (cwd, proc.stdout.strip()))
+
+
+class StandaloneFallbackContract(unittest.TestCase):
+    """The absent-config fallback, exercised end to end.
+
+    The de-duplication task this suite came from required the shared gate to
+    "fall back to defaults when the [config] file is absent".  load_config()
+    returning DEFAULT_CONFIG is only half of that contract; the other half is
+    that a checkout with no `.ci/gate.config.json` anywhere actually RUNS,
+    renders an obviously-unconfigured identity, and never borrows a consuming
+    repository's name.
+
+    Asserted through a subprocess in a bare directory, because CONFIG is
+    resolved at import time from the tool's own location -- running the gate
+    from inside a consuming repository (the common
+    `cd <repo> && pytest ci/gate/tests/` invocation) would find the
+    repository's real config, and the assertion would pass against the very
+    bug it exists to catch.
+    """
+
+    def _run_standalone(self):
+        """Run `gate` in a sandbox with no config anywhere; return artifacts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tool_dir = os.path.join(tmp, "ci", "gate")
+            os.makedirs(tool_dir)
+            # Copy the tool into the sandbox so the __file__-anchored config
+            # lookup cannot escape upward to this test's own checkout.
+            shutil.copy(os.path.join(TOOL, "gate.py"),
+                        os.path.join(tool_dir, "gate.py"))
+            reports = os.path.join(tmp, "analysis", "gitleaks")
+            os.makedirs(reports)
+            with open(os.path.join(reports, "report.json"), "w",
+                      encoding="utf-8") as fh:
+                json.dump({"tool": "gitleaks", "findings": []}, fh)
+            env = dict(os.environ)
+            env.pop("GATE_CONFIG", None)
+            proc = subprocess.run(
+                [sys.executable, os.path.join(tool_dir, "gate.py"), "gate",
+                 "--reports", reports, "--expect", "gitleaks",
+                 "--out-dir", os.path.join(tmp, "out")],
+                capture_output=True, text=True, env=env, cwd=tmp)
+            self.assertEqual(
+                proc.returncode, 0,
+                "a config-free checkout must still run the gate (the default "
+                "fallback is load-bearing); got rc=%d\nstdout:\n%s\nstderr:\n%s"
+                % (proc.returncode, proc.stdout, proc.stderr))
+            with open(os.path.join(tmp, "out", "summary.md"),
+                      encoding="utf-8") as fh:
+                summary = fh.read()
+            with open(os.path.join(tmp, "out", "findings.sarif"),
+                      encoding="utf-8") as fh:
+                sarif = json.load(fh)
+            return summary, sarif
+
+    def test_absent_config_renders_placeholder_identity(self):
+        summary, sarif = self._run_standalone()
+        self.assertTrue(
+            summary.startswith("## this repository static analysis"),
+            "summary header must render the neutral placeholder, not a "
+            "repository's name: %r" % summary.splitlines()[0])
+        self.assertIn(
+            "UNCONFIGURED:", summary,
+            "a config-free run must announce itself as unconfigured in the "
+            "footer, so a reviewer can tell it apart from a configured one")
+        self.assertEqual(
+            sarif["runs"][0]["tool"]["driver"]["name"], "ci-gate",
+            "the SARIF driver must be the neutral default in a config-free "
+            "run, never a repository's driver name")
+
+    def test_absent_config_never_borrows_a_repository_identity(self):
+        summary, sarif = self._run_standalone()
+        driver = sarif["runs"][0]["tool"]["driver"]
+        rendered = "%s\n%s\n%s" % (summary, driver.get("name", ""),
+                                   driver.get("informationUri", ""))
+        for name in ("deaf", "elimination", "mouse", "neural",
+                     "NeuralForge", "Mouse", "Elimination"):
+            self.assertNotIn(
+                name, rendered,
+                "a config-free run rendered %r -- the fallback defaults must "
+                "never reproduce a consuming repository's identity, because "
+                "that is a silent wrong-repo PR comment" % name)
+
+
+class DocstringIdentity(unittest.TestCase):
+    """The module docstrings describe the SHARED tool, never one repository.
+
+    The pre-migration copies each named their own pipeline in the docstring
+    ("verdict for the `deaf` CI pipeline").  Parameterising that meant moving
+    the pipeline name out of the docstring entirely: a shared docstring that
+    names one repository is wrong for the other three at once.  The per-repo
+    name now lives in each repository's `.ci/gate.config.json` and renders
+    through display_name into the summary header and card bodies, which the
+    parity goldens pin.  This test pins the other side of that choice: no
+    future edit may re-embed a repository name in the shared docstrings.
+    """
+
+    def test_docstrings_name_no_repository(self):
+        for mod_name, mod in (("gate", gate), ("triage", triage)):
+            for span in re.findall(r"`([^`]*)`", mod.__doc__ or ""):
+                self.assertNotIn(
+                    span, ("deaf", "elimination", "mouse", "neural",
+                           "Mouse", "Elimination", "NeuralForge"),
+                    "%s.__doc__ quotes `%s`; the shared docstrings must not "
+                    "name a consuming repository" % (mod_name, span))
+
+    def test_gate_docstring_keeps_the_generic_pipeline_phrasing(self):
+        self.assertIn(
+            "for a repository's CI pipeline", gate.__doc__ or "",
+            "the shared docstring must describe a repository in general; "
+            "the per-repo pipeline name lives in .ci/gate.config.json and "
+            "renders via display_name")
 
 
 if __name__ == "__main__":
